@@ -10,7 +10,10 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.layers.sampler import apply_custom_logit_processor
+from sglang.srt.layers.sampler import (
+    apply_custom_logit_processor,
+    top_p_normalize_probs_torch,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils import is_cuda, is_musa
 
@@ -53,6 +56,31 @@ else:
 
 def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
+
+
+def _top_k_renorm_torch(probs: torch.Tensor, top_ks: torch.Tensor) -> torch.Tensor:
+    # Same keep-mask convention as top_k_top_p_min_p_sampling_from_probs_torch.
+    probs_sort, probs_idx = probs.sort(dim=-1, descending=True)
+    ranks = torch.arange(probs.shape[-1], device=probs.device).view(1, -1)
+    probs_sort[ranks >= top_ks.view(-1, 1)] = 0.0
+    probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+    return torch.zeros_like(probs_sort).scatter_(-1, probs_idx, probs_sort)
+
+
+# The sgl_kernel renorm kernels are CUDA/MUSA-only, but DSPARK reaches
+# build_dflash_verify_target_probs from its own triton accept kernel on every
+# device, so the renorm has to resolve to something callable off CUDA. DFLASH's
+# tree-kernel path stays gated on _DFLASH_SAMPLING_VERIFY_AVAILABLE.
+def _renorm_top_k(probs: torch.Tensor, top_ks: torch.Tensor) -> torch.Tensor:
+    if top_k_renorm_prob is None:
+        return _top_k_renorm_torch(probs, top_ks)
+    return top_k_renorm_prob(probs, top_ks)
+
+
+def _renorm_top_p(probs: torch.Tensor, top_ps: torch.Tensor) -> torch.Tensor:
+    if top_p_renorm_prob is None:
+        return top_p_normalize_probs_torch(probs, top_ps)
+    return top_p_renorm_prob(probs, top_ps)
 
 
 def scale_kv_cell_size_per_token_for_dflash(
@@ -772,7 +800,7 @@ def build_dflash_verify_target_probs(
                 repeated_top_ps = torch.repeat_interleave(
                     sampling_info.top_ps, draft_token_num, dim=0
                 )
-                topk_probs = top_p_renorm_prob(topk_probs, repeated_top_ps)
+                topk_probs = _renorm_top_p(topk_probs, repeated_top_ps)
 
             target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
             target_probs.scatter_(1, topk_indices, topk_probs)
@@ -781,12 +809,12 @@ def build_dflash_verify_target_probs(
     if not sparse_topk_applied:
         target_probs = F.softmax(scaled_logits, dim=-1)
         if need_top_k:
-            target_probs = top_k_renorm_prob(
+            target_probs = _renorm_top_k(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
             )
         if need_top_p:
-            target_probs = top_p_renorm_prob(
+            target_probs = _renorm_top_p(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
             )
